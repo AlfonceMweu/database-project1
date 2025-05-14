@@ -153,3 +153,136 @@ CREATE TABLE AuditLog (
     action_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES Users(user_id)
 );
+-- Create indexes for frequently queried columns
+CREATE INDEX idx_patient_name ON Patients(last_name, first_name);
+CREATE INDEX idx_doctor_name ON Doctors(last_name, first_name);
+CREATE INDEX idx_appointment_date ON Appointments(appointment_date, status);
+CREATE INDEX idx_medical_record_patient ON MedicalRecords(patient_id);
+CREATE INDEX idx_invoice_status ON Invoices(status);
+CREATE INDEX idx_payment_invoice ON Payments(invoice_id);
+-- View for today's appointments
+CREATE VIEW TodayAppointments AS
+SELECT 
+    a.appointment_id,
+    CONCAT(p.first_name, ' ', p.last_name) AS patient_name,
+    CONCAT(d.first_name, ' ', d.last_name) AS doctor_name,
+    c.name AS clinic_name,
+    a.appointment_date,
+    a.start_time,
+    a.end_time,
+    a.status
+FROM 
+    Appointments a
+JOIN 
+    Patients p ON a.patient_id = p.patient_id
+JOIN 
+    Doctors d ON a.doctor_id = d.doctor_id
+JOIN 
+    Clinics c ON a.clinic_id = c.clinic_id
+WHERE 
+    a.appointment_date = CURDATE()
+ORDER BY 
+    a.start_time;
+
+-- View for patient medical history
+CREATE VIEW PatientMedicalHistory AS
+SELECT 
+    mr.record_id,
+    CONCAT(p.first_name, ' ', p.last_name) AS patient_name,
+    CONCAT(d.first_name, ' ', d.last_name) AS doctor_name,
+    mr.record_date,
+    mr.diagnosis,
+    mr.treatment,
+    GROUP_CONCAT(pr.medication_name SEPARATOR ', ') AS medications
+FROM 
+    MedicalRecords mr
+JOIN 
+    Patients p ON mr.patient_id = p.patient_id
+JOIN 
+    Doctors d ON mr.doctor_id = d.doctor_id
+LEFT JOIN 
+    Prescriptions pr ON mr.record_id = pr.record_id
+GROUP BY 
+    mr.record_id;
+-- Procedure to book an appointment
+DELIMITER //
+CREATE PROCEDURE BookAppointment(
+    IN p_patient_id INT,
+    IN p_doctor_id INT,
+    IN p_clinic_id INT,
+    IN p_appointment_date DATE,
+    IN p_start_time TIME,
+    IN p_reason TEXT
+)
+BEGIN
+    DECLARE duration_min INT DEFAULT 30; -- Default appointment duration
+    DECLARE end_time TIME;
+    
+    -- Calculate end time based on service duration
+    SELECT COALESCE(SUM(s.duration), 30) INTO duration_min
+    FROM AppointmentServices aps
+    JOIN Services s ON aps.service_id = s.service_id
+    WHERE aps.appointment_id = p_appointment_id;
+    
+    SET end_time = ADDTIME(p_start_time, SEC_TO_TIME(duration_min * 60));
+    
+    -- Check if doctor is available
+    IF EXISTS (
+        SELECT 1 FROM DoctorSchedules 
+        WHERE doctor_id = p_doctor_id 
+        AND clinic_id = p_clinic_id
+        AND day_of_week = DAYNAME(p_appointment_date)
+        AND is_available = TRUE
+        AND p_start_time BETWEEN start_time AND end_time
+    ) AND NOT EXISTS (
+        SELECT 1 FROM Appointments
+        WHERE doctor_id = p_doctor_id
+        AND appointment_date = p_appointment_date
+        AND (
+            (p_start_time BETWEEN start_time AND end_time)
+            OR (end_time BETWEEN start_time AND end_time)
+        )
+        AND status != 'Cancelled'
+    ) THEN
+        -- Insert the appointment
+        INSERT INTO Appointments (
+            patient_id, doctor_id, clinic_id, 
+            appointment_date, start_time, end_time, reason
+        ) VALUES (
+            p_patient_id, p_doctor_id, p_clinic_id,
+            p_appointment_date, p_start_time, end_time, p_reason
+        );
+        
+        SELECT LAST_INSERT_ID() AS appointment_id, 'Appointment booked successfully' AS message;
+    ELSE
+        SIGNAL SQLSTATE '45000' 
+        SET MESSAGE_TEXT = 'Doctor is not available at the requested time';
+    END IF;
+END //
+DELIMITER ;
+
+-- Procedure to generate invoice
+DELIMITER //
+CREATE PROCEDURE GenerateInvoice(IN p_appointment_id INT)
+BEGIN
+    DECLARE v_total DECIMAL(10, 2);
+    DECLARE v_patient_id INT;
+    
+    -- Get patient ID from appointment
+    SELECT patient_id INTO v_patient_id FROM Appointments WHERE appointment_id = p_appointment_id;
+    
+    -- Calculate total from appointment services
+    SELECT SUM(aps.quantity * aps.unit_price) INTO v_total
+    FROM AppointmentServices aps
+    WHERE aps.appointment_id = p_appointment_id;
+    
+    -- Insert invoice
+    INSERT INTO Invoices (
+        appointment_id, patient_id, invoice_date, due_date, total_amount
+    ) VALUES (
+        p_appointment_id, v_patient_id, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 14 DAY), v_total
+    );
+    
+    SELECT LAST_INSERT_ID() AS invoice_id, v_total AS amount_due;
+END //
+DELIMITER ;
